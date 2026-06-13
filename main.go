@@ -23,6 +23,19 @@ var (
 	dwarfline = flag.Bool("dwarfline", false, "use line numbers from DWARF metadata")
 	version   = flag.Bool("version", false, "print version and exit")
 
+	// maxfunc bounds the size of generated functions: any function with more
+	// than this many AST nodes has large structured blocks moved into helper
+	// functions (see outline.go). The Go compiler's per-function optimization
+	// cost is super-linear, so a few enormous functions can make a module slow
+	// or impossible to compile; splitting them keeps the cost bounded and lets
+	// big modules build with no special flags. 0 disables splitting.
+	maxfunc = flag.Int("maxfunc", 0, "split functions larger than this many AST nodes into helpers (0 disables)")
+
+	// debug: only outline the first N eligible functions (-1 = no limit).
+	outlineLimit = flag.Int("outline-limit", -1, "debug: outline only the first N functions")
+	// debug: perform only the first N block extractions total (-1 = no limit).
+	extractLimit = flag.Int("extract-limit", -1, "debug: perform only the first N extractions")
+
 	provided  stringFlags
 	embedFile string
 )

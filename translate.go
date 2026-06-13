@@ -81,6 +81,10 @@ type translator struct {
 	// Debug.
 	codeStart     uint64
 	debugSections map[string][]byte
+
+	outlineSeq   int // names outlining helpers of functions not yet named
+	outlineDone  int // debug: count of functions outlined (for -outline-limit)
+	extractCount int // debug: count of block extractions (for -extract-limit)
 }
 
 func translate(r io.Reader, w io.Writer) error {

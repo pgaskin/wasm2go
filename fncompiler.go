@@ -615,12 +615,22 @@ func (fn *funcCompiler) cleanup() {
 
 	if *noopt {
 		passes.RemoveUnusedLocals(fn.decl)
+		// Split oversized functions even with -noopt; they are otherwise
+		// unbuildable. The block structure is intact at this point.
+		if *maxfunc > 0 {
+			fn.outline(*maxfunc)
+		}
 		return
 	}
 
 	passes.RemoveSelfAssigns(fn.decl)
 	passes.RemoveBlankAssigns(fn.decl)
 	passes.RemoveUnusedLocals(fn.decl)
+	// Split oversized functions before UnnestBlocks, while the structured block
+	// tree (one BlockStmt per Wasm block/loop) is still intact.
+	if *maxfunc > 0 {
+		fn.outline(*maxfunc)
+	}
 	passes.UnnestBlocks(fn.decl)
 	passes.RemoveEmptyStmts(fn.decl)
 	passes.InlineGotoEnd(fn.decl)
