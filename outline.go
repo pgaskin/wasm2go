@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"log"
+	"maps"
 	"slices"
 	"strconv"
 
@@ -230,10 +231,10 @@ const minUnit = 24
 
 // unit is an extractable structured block found within a function body.
 type unit struct {
-	node    ast.Node        // statement to replace (a BlockStmt or its LabeledStmt)
-	block   *ast.BlockStmt  // the block's body
-	size    int             // node count of block
-	replace func(ast.Node)  // O(1) in-place replacement of node
+	node    ast.Node       // statement to replace (a BlockStmt or its LabeledStmt)
+	block   *ast.BlockStmt // the block's body
+	size    int            // node count of block
+	replace func(ast.Node) // O(1) in-place replacement of node
 }
 
 // split extracts oversized structured blocks from body into helpers until body
@@ -276,7 +277,6 @@ func (o *outliner) split(body *ast.BlockStmt, isMain bool) map[int]bool {
 // into a block once it is recorded as a unit.
 func (o *outliner) findUnits(b *ast.BlockStmt, out *[]unit) {
 	for i := range b.List {
-		i := i
 		o.findInStmt(b.List[i], func(n ast.Node) { b.List[i] = n.(ast.Stmt) }, out)
 	}
 }
@@ -312,7 +312,6 @@ func (o *outliner) findInStmt(s ast.Stmt, replace func(ast.Node), out *[]unit) {
 		for _, cc := range x.Body.List {
 			if c, ok := cc.(*ast.CaseClause); ok {
 				for j := range c.Body {
-					j := j
 					o.findInStmt(c.Body[j], func(n ast.Node) { c.Body[j] = n.(ast.Stmt) }, out)
 				}
 			}
@@ -377,10 +376,16 @@ func (o *outliner) extract(u unit, isMain bool, escapes map[int]bool, callerLabe
 	if ls, ok := node.(*ast.LabeledStmt); ok {
 		hbody.List = append(hbody.List, &ast.LabeledStmt{Label: ls.Label, Stmt: &ast.EmptyStmt{}})
 		hbody.List = append(hbody.List, block.List...)
-		hbody.List = append(hbody.List, retLit(selNormal))
 	} else {
-		block.List = append(block.List, retLit(selNormal))
 		hbody = block
+	}
+	// Append the normal-completion return only when the body can fall off its
+	// end; if it already ends in a terminator (e.g. an escaping goto rewritten to
+	// `return <sel>`), an appended return would be unreachable. fellThrough also
+	// tells the dispatch whether a selNormal case is needed at all.
+	fellThrough := !terminates(hbody.List)
+	if fellThrough {
+		hbody.List = append(hbody.List, retLit(selNormal))
 	}
 
 	helper := &ast.FuncDecl{
@@ -415,7 +420,7 @@ func (o *outliner) extract(u unit, isMain bool, escapes map[int]bool, callerLabe
 		}
 	}
 
-	dispatch := o.makeDispatch(name, esc, isMain, avail, escapes)
+	dispatch := o.makeDispatch(name, esc, isMain, fellThrough, avail, escapes)
 	// Wrap in a block so the replacement is valid both as a list element and in
 	// a *ast.BlockStmt slot (an if branch); UnnestBlocks tidies it away later.
 	u.replace(&ast.BlockStmt{List: []ast.Stmt{dispatch}})
@@ -468,14 +473,20 @@ func scanSelectorReturns(n ast.Node) map[int]bool {
 // selector. Selectors naming a label in callerLabels become a goto; selReturn
 // in the top-level function returns the frame results; anything else is
 // propagated to the caller (and recorded in the enclosing escapes set).
-func (o *outliner) makeDispatch(name string, esc map[int]bool, isMain bool, callerLabels map[string]bool, escapes map[int]bool) ast.Stmt {
+func (o *outliner) makeDispatch(name string, esc map[int]bool, isMain, fellThrough bool, callerLabels map[string]bool, escapes map[int]bool) ast.Stmt {
 	sel := newID("__sel")
 	var cases []ast.Stmt
 
-	// Normal completion: fall through (continue after the block).
-	cases = append(cases, &ast.CaseClause{List: []ast.Expr{intLit(selNormal)}})
+	// Normal completion: fall through (continue after the block). Only the
+	// helpers that can fall off their end ever return selNormal, so the clause
+	// is omitted otherwise to avoid a dead case.
+	if fellThrough {
+		cases = append(cases, &ast.CaseClause{List: []ast.Expr{intLit(selNormal)}})
+	}
 
-	for s := range esc {
+	// Iterate selectors in sorted order so the generated case clauses are
+	// deterministic across runs (map iteration order is randomized).
+	for _, s := range slices.Sorted(maps.Keys(esc)) {
 		switch {
 		case s == selReturn:
 			if isMain {
@@ -558,17 +569,15 @@ func (o *outliner) rewriteFrame(n ast.Node) {
 				}
 			}
 		}
+		// Replace the whole var decl with a zeroing assignment (or an empty
+		// statement when nothing needs zeroing); RemoveEmptyStmts tidies the
+		// latter. Replace, never delete: the decl may sit in a non-list slot
+		// (e.g. a labeled statement's body) that still requires a statement.
 		var repl ast.Stmt = &ast.EmptyStmt{}
 		if len(lhs) > 0 {
 			repl = &ast.AssignStmt{Tok: token.ASSIGN, Lhs: lhs, Rhs: rhs}
 		}
-		if c.Index() >= 0 {
-			c.Replace(repl)
-		} else if len(lhs) > 0 {
-			c.Replace(repl)
-		} else {
-			c.Replace(&ast.EmptyStmt{})
-		}
+		c.Replace(repl)
 		return true
 	})
 
@@ -633,6 +642,40 @@ func collectLabels(n ast.Node) map[string]bool {
 		return true
 	})
 	return labels
+}
+
+// terminates reports whether stmts definitely ends in a terminating statement
+// (one that always transfers control away), so an appended fall-through return
+// would be unreachable. It is conservative — recognizing only the constructs
+// this pass and the front-end generate — because a false positive would drop a
+// return that Go requires.
+func terminates(stmts []ast.Stmt) bool {
+	if len(stmts) == 0 {
+		return false
+	}
+	return terminatingStmt(stmts[len(stmts)-1])
+}
+
+func terminatingStmt(s ast.Stmt) bool {
+	switch x := s.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return x.Tok == token.GOTO
+	case *ast.LabeledStmt:
+		return terminatingStmt(x.Stmt)
+	case *ast.BlockStmt:
+		return terminates(x.List)
+	case *ast.IfStmt:
+		return x.Else != nil && terminatingStmt(x.Body) && terminatingStmt(x.Else)
+	case *ast.ExprStmt:
+		if call, ok := x.X.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "panic" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // nodeCount returns the number of AST nodes in n, a proxy for compile cost.
