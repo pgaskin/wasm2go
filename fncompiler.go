@@ -631,6 +631,7 @@ func (fn *funcCompiler) cleanup() {
 	if *maxfunc > 0 {
 		fn.outline(*maxfunc)
 	}
+	passes.InlineSwitchGotos(fn.decl)
 	passes.UnnestBlocks(fn.decl)
 	passes.RemoveEmptyStmts(fn.decl)
 	passes.InlineGotoEnd(fn.decl)
